@@ -25,7 +25,15 @@ jobs:
       - name: Determine version bump
         id: bump
         run: |
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -z "$LATEST_TAG" ]; then
+            # Fresh fork / repo without tags: continue versioning from the
+            # Makefile instead of restarting at v0.0.0 (which would downgrade
+            # PKG_VERSION on the first release).
+            MKV=$(sed -n 's/^PKG_VERSION:=//p' luci-app-trafficctl/Makefile | head -1)
+            LATEST_TAG="v${MKV:-0.0.0}"
+            echo "No tags found — using Makefile version as baseline: $LATEST_TAG"
+          fi
           echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
 
           # Get commits since last tag
@@ -66,12 +74,22 @@ jobs:
           TAG="${{ steps.bump.outputs.latest_tag }}"
           REPO="${{ github.repository }}"
 
+          # The baseline may come from the Makefile (fork without tags) and
+          # not exist as a git ref — fall back to the full history then.
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            RANGE="${TAG}..HEAD"
+            HAVE_TAG=1
+          else
+            RANGE="HEAD"
+            HAVE_TAG=0
+          fi
+
           # Print one Markdown bullet per commit matching $TYPE_REGEX.
           # Format:  - <subject without prefix> ([short-sha](commit-url))
           #          <up to the first body paragraph, indented> (optional)
           format_section() {
             type_regex="$1"
-            git log "${TAG}..HEAD" --reverse --pretty=format:'%H%x09%s%x09%b%x1e' |
+            git log "$RANGE" --reverse --pretty=format:'%H%x09%s%x09%b%x1e' |
               tr -d '\r' |
               awk -v type_re="^${type_regex}(\\([^)]*\\))?:" \
                   -v repo="$REPO" '
@@ -149,8 +167,10 @@ jobs:
               echo ""
             fi
 
-            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${TAG}...${{ steps.bump.outputs.new_tag }}"
-            echo ""
+            if [ "$HAVE_TAG" = "1" ]; then
+              echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${TAG}...${{ steps.bump.outputs.new_tag }}"
+              echo ""
+            fi
             echo "---"
             echo ""
             echo "### Download"
@@ -194,8 +214,24 @@ jobs:
           ln -f dist/luci-app-trafficctl_*_all.ipk dist/luci-app-trafficctl.ipk
           cp dist/*.ipk /tmp/
 
-      - name: Build .apk (via OpenWrt SDK, signed)
+      # Secrets are not readable from step `if:` expressions, so detect them
+      # in a run step. Forks won't have the upstream signing keys — they get
+      # an unsigned APK from build-apk.sh instead of a failed release.
+      - name: Check APK signing secrets
+        id: apk_secrets
         if: steps.bump.outputs.bump != 'none'
+        env:
+          APK_KEY: ${{ secrets.APK_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APK_KEY" ]; then
+            echo "have=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::APK signing secrets not configured — building unsigned APK with build-apk.sh (installable with 'apk add --allow-untrusted')"
+          fi
+
+      - name: Build .apk (via OpenWrt SDK, signed)
+        if: steps.bump.outputs.bump != 'none' && steps.apk_secrets.outputs.have == '1'
         uses: openwrt/gh-action-sdk@main
         env:
           ARCH: x86_64-25.12.4
@@ -206,7 +242,7 @@ jobs:
           KEY_BUILD: ${{ secrets.USIGN_PRIVATE_KEY }}
 
       - name: Collect APK
-        if: steps.bump.outputs.bump != 'none'
+        if: steps.bump.outputs.bump != 'none' && steps.apk_secrets.outputs.have == '1'
         run: |
           mkdir -p dist
           cp /tmp/luci-app-trafficctl*.ipk dist/ 2>/dev/null || true
@@ -219,6 +255,17 @@ jobs:
             echo "::error::APK not found in SDK output"
             find bin/ -type f -name "*.apk" || true
             exit 1
+          fi
+
+      - name: Build .apk (standalone, unsigned fallback)
+        if: steps.bump.outputs.bump != 'none' && steps.apk_secrets.outputs.have != '1'
+        run: |
+          APK_FILE=$(sh build-apk.sh "${{ steps.bump.outputs.new_version }}" 1 | tail -1)
+          if [ -f "$APK_FILE" ]; then
+            ln -f "$APK_FILE" dist/luci-app-trafficctl_noarch.apk
+            ln -f "$APK_FILE" dist/luci-app-trafficctl.apk
+          else
+            echo "::warning::build-apk.sh produced no APK — releasing IPK only"
           fi
 
       - name: Create GitHub Release

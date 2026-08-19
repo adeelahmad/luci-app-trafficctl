@@ -7,6 +7,17 @@
 
 SHAPES_FILE="/etc/trafficctl/shapes.json"
 LAN_DEV=$(tctl_get_lan_device)
+# Upload is shaped on the WAN device's egress — the only place LAN->WAN
+# traffic can be queued. Shaping the LAN device alone (as this did originally)
+# only ever touches the download direction.
+# Upload is shaped on an IFB device fed from LAN-side ingress, NOT on the WAN
+# device: by the time a packet reaches WAN egress, POSTROUTING has already
+# masqueraded its source to the router's WAN address, so a per-client
+# "match ip src" filter there matches nothing. Redirecting ingress into an IFB
+# shapes it while the client's real source address is still intact — which is
+# also what makes it work for routed/downstream clients.
+IFB_DEV=$(uci -q get trafficctl.main.shape_ifb 2>/dev/null)
+[ -z "$IFB_DEV" ] && IFB_DEV="tctl-ifb0"
 
 ACTION="$1"
 IP="$2"
@@ -26,13 +37,61 @@ ip_to_classid() {
 }
 
 ensure_root_qdisc() {
+    local dev="${1:-$LAN_DEV}"
     # Set up root HTB hierarchy if not present
-    tc class show dev "$LAN_DEV" 2>/dev/null | grep -q "class htb 1:1 " && return 0
-    tc qdisc del dev "$LAN_DEV" root 2>/dev/null
-    tc qdisc add dev "$LAN_DEV" root handle 1: htb default fffe r2q 10
-    tc class add dev "$LAN_DEV" parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit burst 125000b cburst 125000b
-    tc class add dev "$LAN_DEV" parent 1:1 classid 1:fffe htb rate 1000mbit ceil 1000mbit burst 125000b cburst 125000b prio 0
-    tc qdisc add dev "$LAN_DEV" parent 1:fffe fq_codel 2>/dev/null
+    tc class show dev "$dev" 2>/dev/null | grep -q "class htb 1:1 " && return 0
+    tc qdisc del dev "$dev" root 2>/dev/null
+    tc qdisc add dev "$dev" root handle 1: htb default fffe r2q 10
+    tc class add dev "$dev" parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit burst 125000b cburst 125000b
+    tc class add dev "$dev" parent 1:1 classid 1:fffe htb rate 1000mbit ceil 1000mbit burst 125000b cburst 125000b prio 0
+    tc qdisc add dev "$dev" parent 1:fffe fq_codel 2>/dev/null
+}
+
+# Bring up the IFB device and mirror LAN-side ingress into it. Needs kmod-ifb
+# and act_mirred; returns non-zero when either is missing so callers can report
+# download-only shaping instead of pretending upload is limited.
+ensure_ifb() {
+    local dev
+    if ! ip link show "$IFB_DEV" >/dev/null 2>&1; then
+        ip link add name "$IFB_DEV" type ifb 2>/dev/null || return 1
+    fi
+    ip link set "$IFB_DEV" up 2>/dev/null || return 1
+    ensure_root_qdisc "$IFB_DEV" || return 1
+
+    for dev in $(tctl_ingress_devices); do
+        tc qdisc show dev "$dev" ingress 2>/dev/null | grep -q 'qdisc ingress' || \
+            tc qdisc add dev "$dev" handle ffff: ingress 2>/dev/null
+        tc filter show dev "$dev" parent ffff: 2>/dev/null | grep -q mirred || \
+            tc filter add dev "$dev" parent ffff: protocol ip prio 1 u32 \
+                match u32 0 0 action mirred egress redirect dev "$IFB_DEV" 2>/dev/null
+    done
+    # Useless unless at least the IFB root exists.
+    tc class show dev "$IFB_DEV" 2>/dev/null | grep -q "class htb 1:1 "
+}
+
+# Attach one shaping class on a device, matching the given IP in the given
+# direction ("dst" on the LAN side for download, "src" on the WAN side for
+# upload).
+shape_attach() {
+    local dev="$1" match="$2" ip="$3" classid="$4" rate="$5" burst="$6"
+
+    tc filter del dev "$dev" parent 1:0 prio 10 protocol ip u32 match ip "$match" "$ip"/32 2>/dev/null
+    tc qdisc del dev "$dev" parent "$classid" 2>/dev/null
+    tc class del dev "$dev" classid "$classid" 2>/dev/null
+
+    ensure_root_qdisc "$dev" || return 1
+    tc class add dev "$dev" parent 1:1 classid "$classid" htb \
+        rate "${rate}kbit" ceil "${rate}kbit" burst "${burst}b" cburst "${burst}b" 2>&1 || return 1
+    tc qdisc add dev "$dev" parent "$classid" fq_codel 2>/dev/null
+    tc filter add dev "$dev" parent 1:0 prio 10 protocol ip u32 \
+        match ip "$match" "$ip"/32 flowid "$classid" 2>&1 || return 1
+}
+
+shape_detach() {
+    local dev="$1" match="$2" ip="$3" classid="$4"
+    tc filter del dev "$dev" parent 1:0 prio 10 protocol ip u32 match ip "$match" "$ip"/32 2>/dev/null
+    tc qdisc del dev "$dev" parent "$classid" 2>/dev/null
+    tc class del dev "$dev" classid "$classid" 2>/dev/null
 }
 
 save_shape() {
@@ -82,41 +141,40 @@ do_add() {
     local classid
     classid=$(ip_to_classid "$IP")
 
-    ensure_root_qdisc
-
-    # Remove existing class for this IP if present
-    tc filter del dev "$LAN_DEV" parent 1:0 prio 10 protocol ip u32 match ip dst "$IP"/32 2>/dev/null
-    tc qdisc del dev "$LAN_DEV" parent "$classid" 2>/dev/null
-    tc class del dev "$LAN_DEV" classid "$classid" 2>/dev/null
-
     # Calculate burst: 10ms of data, minimum 1600 bytes
     local burst_bytes
     burst_bytes=$(( RATE * 125 / 100 ))
     [ "$burst_bytes" -lt 1600 ] && burst_bytes=1600
 
-    # Add class and filter
-    if ! tc class add dev "$LAN_DEV" parent 1:1 classid "$classid" htb \
-        rate "${RATE}kbit" ceil "${RATE}kbit" burst "${burst_bytes}b" cburst "${burst_bytes}b" 2>&1; then
-        echo "{\"ok\":false,\"msg\":\"tc class add failed for $IP\"}"
-        return 1
-    fi
-    tc qdisc add dev "$LAN_DEV" parent "$classid" fq_codel 2>/dev/null
-    if ! tc filter add dev "$LAN_DEV" parent 1:0 prio 10 protocol ip u32 match ip dst "$IP"/32 flowid "$classid" 2>&1; then
-        echo "{\"ok\":false,\"msg\":\"tc filter add failed for $IP\"}"
+    # Download: queue on the LAN device, matching traffic destined to the client.
+    if ! shape_attach "$LAN_DEV" dst "$IP" "$classid" "$RATE" "$burst_bytes"; then
+        echo "{\"ok\":false,\"msg\":\"tc setup failed for $IP on $LAN_DEV\"}"
         return 1
     fi
 
+    # Upload: shaped pre-NAT on the IFB device fed from LAN ingress.
+    # Reported separately so a missing kmod-ifb doesn't look like total failure.
+    local ul_ok=1
+    if ensure_ifb; then
+        shape_attach "$IFB_DEV" src "$IP" "$classid" "$RATE" "$burst_bytes" || ul_ok=0
+    else
+        ul_ok=0
+    fi
+
     save_shape "$IP" "$RATE"
-    echo "{\"ok\":true,\"msg\":\"shape ${RATE} kbit/s applied to $IP (class $classid)\"}"
+    if [ "$ul_ok" = "1" ]; then
+        echo "{\"ok\":true,\"msg\":\"shape ${RATE} kbit/s applied to $IP both directions (class $classid)\"}"
+    else
+        echo "{\"ok\":true,\"msg\":\"shape ${RATE} kbit/s applied to $IP (download only — upload needs kmod-ifb: opkg/apk install kmod-ifb kmod-sched)\"}"
+    fi
 }
 
 do_remove() {
     local classid
     classid=$(ip_to_classid "$IP")
 
-    tc filter del dev "$LAN_DEV" parent 1:0 prio 10 protocol ip u32 match ip dst "$IP"/32 2>/dev/null
-    tc qdisc del dev "$LAN_DEV" parent "$classid" 2>/dev/null
-    tc class del dev "$LAN_DEV" classid "$classid" 2>/dev/null
+    shape_detach "$LAN_DEV" dst "$IP" "$classid"
+    shape_detach "$IFB_DEV" src "$IP" "$classid"
 
     remove_shape "$IP"
     echo "{\"ok\":true,\"msg\":\"shape removed for $IP\"}"

@@ -26,12 +26,22 @@ else
     PREFIX="192.168"
 fi
 
+# Map classid → real IP from persisted shapes. Routed/downstream IPs (e.g.
+# 10.0.0.x behind a second router) don't share the LAN prefix, so
+# reconstructing the address from the classid alone would mislabel them.
+CLASSMAP=$(grep -oE '\{"ip":"[^"]+","rate_kbit":[0-9]+\}' /etc/trafficctl/shapes.json 2>/dev/null | \
+    sed 's/{"ip":"\([^"]*\)".*/\1/' | while read -r sip; do
+        s3=$(echo "$sip" | cut -d. -f3)
+        s4=$(echo "$sip" | cut -d. -f4)
+        printf "1:%x %s\n" "$((s3 * 256 + s4))" "$sip"
+    done)
+
 # Collect class stats into a temp file so we can merge with qdisc stats
 CLASS_DATA=$(tc -s class show dev "$LAN_DEV" 2>/dev/null)
 QDISC_DATA=$(tc -s qdisc show dev "$LAN_DEV" 2>/dev/null)
 
 # Parse class stats: emit lines "classid ip rate bytes pkts backlog drops overlimits requeues lended borrowed"
-CLASS_PARSED=$(echo "$CLASS_DATA" | awk -v prefix="$PREFIX" '
+CLASS_PARSED=$(echo "$CLASS_DATA" | awk -v prefix="$PREFIX" -v classmap="$CLASSMAP" '
 function hex2dec(hex,    i, c, dec, len) {
     dec = 0
     len = length(hex)
@@ -48,12 +58,25 @@ function hex2dec(hex,    i, c, dec, len) {
     return dec
 }
 
+function class_ip(cid, o3, o4) {
+    if (cid in ipmap) return ipmap[cid]
+    return sprintf("%s.%d.%d", prefix, o3, o4)
+}
+
+BEGIN {
+    n = split(classmap, cml, "\n")
+    for (ci = 1; ci <= n; ci++) {
+        split(cml[ci], cmf, " ")
+        if (cmf[1] != "" && cmf[2] != "") ipmap[cmf[1]] = cmf[2]
+    }
+}
+
 /class fq_codel/ { skip = 1; next }
 /^class htb 1:/ {
     # emit previous record if valid
     if (have_record && current_rate > 0 && current_rate < 1000000) {
-        printf "%s %s.%d.%d %d %d %d %d %d %d %d %d %d\n", \
-            classid, prefix, current_o3, current_o4, current_rate, \
+        printf "%s %s %d %d %d %d %d %d %d %d %d\n", \
+            classid, class_ip(classid, current_o3, current_o4), current_rate, \
             bytes, pkts, backlog, drops, overlimits, requeues, lended, borrowed
     }
     minor = $3
@@ -112,8 +135,8 @@ function hex2dec(hex,    i, c, dec, len) {
 }
 END {
     if (have_record && current_rate > 0 && current_rate < 1000000) {
-        printf "%s %s.%d.%d %d %d %d %d %d %d %d %d %d\n", \
-            classid, prefix, current_o3, current_o4, current_rate, \
+        printf "%s %s %d %d %d %d %d %d %d %d %d\n", \
+            classid, class_ip(classid, current_o3, current_o4), current_rate, \
             bytes, pkts, backlog, drops, overlimits, requeues, lended, borrowed
     }
 }

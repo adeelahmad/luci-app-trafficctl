@@ -21,8 +21,9 @@ All package files live under `luci-app-trafficctl/` (feed-compatible layout — 
 luci-app-trafficctl/
   Makefile                                  — OpenWrt package Makefile (LuCI)
   htdocs/luci-static/resources/view/trafficctl/
-    status.js                               — Main frontend (single-file LuCI view)
-    status.css                              — Frontend styles
+    status.js                               — Main frontend (single-file LuCI view, "Devices" tab)
+    portfw.js                               — "Port Forwards" tab (inbound traffic control)
+    status.css                              — Frontend styles (shared by both views)
   root/usr/local/bin/
     trafficctl-fw.sh                        — Shared library (fw detection, validation, persistence helpers)
     trafficctl-summary.sh                   — All devices summary (JSON array)
@@ -31,6 +32,10 @@ luci-app-trafficctl/
     trafficctl-unblock.sh                   — Unblock internet
     trafficctl-macfilter-add.sh             — WiFi MAC deny (hostapd_cli, no wifi reload)
     trafficctl-macfilter-remove.sh          — WiFi MAC allow
+    trafficctl-names.sh                     — Manual device aliases (/etc/trafficctl/names)
+    trafficctl-rdns-refresh.sh              — Background PTR resolver → /tmp/trafficctl_rdns_cache
+    trafficctl-netify.sh                    — Optional netifyd DPI app labels (status/collect/list/raw)
+    trafficctl-portfw.sh                    — Port-forward/open-port list + inbound pause/limit
     trafficctl-ratelimit.sh                 — nft policing (drop-based)
     trafficctl-ratelimit-stats.sh           — Limiter counters
     trafficctl-shape.sh                     — tc/HTB shaping (queue-based)
@@ -111,14 +116,20 @@ ssh root@192.168.0.1 sh -c '"cat > /www/luci-static/resources/view/trafficctl/st
 ## Key Technical Details
 
 - Traffic data comes from `/proc/net/nf_conntrack` (conntrack parsing)
+- Monitored sources = connected LAN subnets + subnets routed via a LAN next-hop (downstream routers) + `trafficctl.main.extra_subnets` (optional CIDRs); independently, any flow SNAT/masqueraded by this router (reply dst ≠ original src) is picked up as a forwarded client with zero config. Such devices get `conn_type: "routed"`.
 - WiFi detection: `iw dev <iface> station dump` → list of connected MACs
 - WiFi MAC filter: `hostapd_cli deny_acl ADD_MAC` + `deauthenticate` (no wifi reload)
+- Limit targets may be a host, a CIDR (`10.0.20.0/24`), or `all`. Mode `each` (default for any block wider than /32) gives every address its own bucket via an nft `meter` keyed by address; `shared` caps the block in aggregate — a shared cap lets one device starve the rest, hence the default
+- Limits and shapes are **bidirectional**: the limiter polices download at WAN ingress (`ip daddr`, chain `dl`) and upload at LAN ingress (`ip saddr`, one `ul_<dev>` chain per device). **A netdev ingress hook bound to a bridge never sees bridged traffic** — packets are received on the bridge's ports — so `tctl_ingress_devices` expands bridges to their `brif/*` ports; hooking `br-lan` matches nothing and looks like a silently ineffective limit (`TCTL_SYSFS_NET` overrides the sysfs root for tests); the shaper builds a matching HTB class on the LAN device (`match ip dst`, download) and on an **IFB device** fed by `mirred` from LAN-side ingress (`match ip src`, upload). Upload must NOT be shaped at WAN egress: POSTROUTING has already masqueraded the source to the router's WAN address there, so a per-client src filter matches nothing. Needs `kmod-ifb`; without it the shaper applies download only and says so. Policing upload on the way *in* is what makes it work for routed/downstream clients. Both halves must be removed together
 - tc/HTB shaping: classid derived from IP octets (`1:<hex(o3*256+o4)>`)
 - Reserved HTB classids: `1:1` (root), `1:fffe` (default) — skip these
 - Burst calculation for tc: `rate_kbit * 125 / 100` (10ms of data, min 1600 bytes)
 - Persistent shapes stored in `/etc/trafficctl/shapes.json`
 - Persistent blocks/ratelimits stored in `/etc/trafficctl/rules.json` (when `persist_rules` enabled)
 - Note: Only `/etc/config/trafficctl` is tracked as a conffile for package upgrades; runtime JSON files are non-essential and can be regenerated
+- Port-forward control: own nft table `inet tctl_pfw`, chains at forward/input priority -190 (post-DNAT, before the flowtable offload rule); pause = drop rule + conntrack flush, limit = `limit rate over` drop. Rule comments `tctl_pfw_<pause|limit>_<proto>_<ip|local>_<port>` are the source of truth for state
+- Device names: manual alias (`/etc/trafficctl/names`) > DHCP lease > cached reverse DNS. Routed devices have no lease here, so PTR (or an alias) is their only name source; `trafficctl.main.rdns_server` is a space-separated resolver list tried before the system resolver — point it at the downstream router. Lookups never block a poll: the summary reads the cache and spawns `trafficctl-rdns-refresh.sh` detached (max 8 IPs/poll, TTL `rdns_ttl`, `-` = negative cache)
+- Netifyd (DPI) integration is optional and inert unless the agent is installed and its socket exists: **Agent v5's `netifyd.sock` is a request/response API that never streams flows** — telemetry comes from the socket SINK (`netify-sink-socket.json`, typically `tcp://127.0.0.1:1780`), auto-detected by `netify_endpoint`. The payload is the aggregator's `{"stats":[…]}` form (`application_id` = `"<id>.netify.<app>"`, separate `download`/`upload`); raw per-flow records are still handled for v4. `trafficctl-netify.sh collect` samples it into `/tmp/trafficctl_netify.json`, which the summary reads for the per-device `app` field and refreshes detached when older than `netify_interval`. Agent framing is undocumented, so flow records are parsed by field extraction (tolerant of newline-delimited and length-prefixed output) and totals are tracked per flow `digest` — the agent re-emits growing counters, so summing every sighting would multiply-count. Set `TCTL_NETIFY_FEED` to a recorded file to test without a socket
 - Speed measurement: conntrack bytes (BEFORE tc shaper), so reported speed may exceed shaped limit
 - Spike filter: cap speed at 125 MB/s (1 Gbit/s), discard anomalous samples
 - Y-axis scaling: 98th percentile, nice ticks (multiples of 100/500 Kbit/s, min 5 gridlines)

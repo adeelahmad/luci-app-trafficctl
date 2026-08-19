@@ -12,37 +12,92 @@ fi
 
 # ── Rate Limiting (policer) ────────────────────────────────────────────────
 
+# Rate limits are symmetric: the same ceiling is policed in both directions.
+#
+# Download is caught at WAN ingress (packets arriving for the client) and
+# upload at LAN ingress (packets the client sends into the router). Policing
+# upload on the way IN is what makes it work for downstream/routed clients
+# too — their packets still enter over a LAN device with the client's source
+# address, whatever router sits behind it.
+# mode: "each" gives every address inside the target its own bucket (an nft
+# meter keyed by address); "shared" makes the whole target share one bucket.
+# For a single host the two are identical.
 tctl_ratelimit_add() {
-    local ip="$1" rate_kbit="$2" comment="$3"
+    local ip="$1" rate_kbit="$2" comment="$3" mode="${4:-shared}"
     local rate_kbyte=$((rate_kbit / 8))
     [ "$rate_kbyte" -lt 1 ] && rate_kbyte=1
 
+    local slug dl_expr ul_expr
+    slug=$(tctl_target_slug "$ip")
+    if [ "$mode" = "each" ]; then
+        dl_expr="ip daddr $ip meter tctl_d_$slug { ip daddr limit rate over ${rate_kbyte} kbytes/second }"
+        ul_expr="ip saddr $ip meter tctl_u_$slug { ip saddr limit rate over ${rate_kbyte} kbytes/second }"
+    else
+        dl_expr="ip daddr $ip limit rate over ${rate_kbyte} kbytes/second"
+        ul_expr="ip saddr $ip limit rate over ${rate_kbyte} kbytes/second"
+    fi
+
     if [ "$TCTL_FW" = "nft" ]; then
         nft add table netdev tm_ratelimit 2>/dev/null
-        local wan_dev
-        wan_dev=$(tctl_get_wan_device)
-        nft add chain netdev tm_ratelimit dl \
-            "{ type filter hook ingress device $wan_dev priority -200; policy accept; }" 2>/dev/null
-        nft add rule netdev tm_ratelimit dl \
-            "ip daddr $ip limit rate over ${rate_kbyte} kbytes/second counter drop comment \"$comment\""
+
+        local wan_dev rc=0
+        if wan_dev=$(tctl_get_wan_device); then
+            nft add chain netdev tm_ratelimit dl \
+                "{ type filter hook ingress device $wan_dev priority -200; policy accept; }" 2>/dev/null
+            nft add rule netdev tm_ratelimit dl \
+                "$dl_expr counter drop comment \"$comment\"" 2>/dev/null \
+                || rc=1
+        else
+            rc=1
+        fi
+        # Set for the caller to inspect (see trafficctl-ratelimit.sh).
+        # shellcheck disable=SC2034
+        [ "$rc" = "0" ] || TCTL_RL_DOWNLOAD_FAILED=1
+
+        # One chain per ingress device: a device that refuses the hook then
+        # only loses its own chain instead of taking the whole set with it.
+        local dev chain
+        local ul_ok=0
+        for dev in $(tctl_ingress_devices); do
+            chain=$(tctl_ingress_chain "$dev")
+            nft add chain netdev tm_ratelimit "$chain" \
+                "{ type filter hook ingress device $dev priority -200; policy accept; }" 2>/dev/null
+            nft add rule netdev tm_ratelimit "$chain" \
+                "$ul_expr counter drop comment \"${comment}_ul\"" 2>/dev/null \
+                && ul_ok=1
+        done
+        # shellcheck disable=SC2034
+        [ "$ul_ok" = "1" ] || TCTL_RL_UPLOAD_FAILED=1
     else
         iptables -t mangle -A FORWARD -d "$ip" -m hashlimit \
             --hashlimit-above "${rate_kbit}kbit/sec" --hashlimit-burst "${rate_kbit}kbit" \
             --hashlimit-mode dstip --hashlimit-name "rl_${comment}" \
             -j DROP -m comment --comment "$comment" 2>/dev/null
+        iptables -t mangle -A FORWARD -s "$ip" -m hashlimit \
+            --hashlimit-above "${rate_kbit}kbit/sec" --hashlimit-burst "${rate_kbit}kbit" \
+            --hashlimit-mode srcip --hashlimit-name "rl_${comment}_ul" \
+            -j DROP -m comment --comment "${comment}_ul" 2>/dev/null
     fi
 }
 
 tctl_ratelimit_remove() {
     local ip="$1" comment="$2"
+    local chain h
 
     if [ "$TCTL_FW" = "nft" ]; then
-        for h in $(nft -a list chain netdev tm_ratelimit dl 2>/dev/null \
-                   | grep "daddr $ip " | grep -o 'handle [0-9]*' | awk '{print $2}'); do
-            nft delete rule netdev tm_ratelimit dl handle "$h"
+        # Scan the whole table once: rules for this IP live in dl (daddr) and
+        # in one ul_<dev> chain per ingress device (saddr).
+        nft -a list table netdev tm_ratelimit 2>/dev/null | awk -v cmt="$comment" '
+            /^[ \t]*chain [a-zA-Z0-9_]+ \{/ { chain = $2; next }
+            index($0, "\"" cmt "\"") || index($0, "\"" cmt "_ul\"") {
+                for (i = 1; i < NF; i++)
+                    if ($i == "handle") { print chain, $(i+1); break }
+            }' | while read -r chain h; do
+            [ -n "$chain" ] && [ -n "$h" ] && nft delete rule netdev tm_ratelimit "$chain" handle "$h" 2>/dev/null
         done
     else
         while iptables -t mangle -D FORWARD -d "$ip" -m comment --comment "$comment" 2>/dev/null; do :; done
+        while iptables -t mangle -D FORWARD -s "$ip" -m comment --comment "${comment}_ul" 2>/dev/null; do :; done
     fi
 }
 
@@ -90,13 +145,30 @@ tctl_is_blocked() {
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
+# Resolve the WAN device to a name that actually exists as a netdev.
+#
+# The old fallback returned the literal string "wan", which is an interface
+# NAME, not a device — nft then rejected the chain ("device wan" doesn't
+# exist), the failure was swallowed, and download limiting silently did
+# nothing while still reporting success. Every candidate is now verified
+# against sysfs, with the default route as a last resort.
 tctl_get_wan_device() {
-    # Detect WAN interface device name
-    local dev
-    dev=$(uci -q get network.wan.device 2>/dev/null)
-    [ -z "$dev" ] && dev=$(uci -q get network.wan.ifname 2>/dev/null)
-    [ -z "$dev" ] && dev="wan"
-    echo "$dev"
+    local sysfs="${TCTL_SYSFS_NET:-/sys/class/net}"
+    local dev candidates
+
+    candidates="$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+$(uci -q get network.wan.device 2>/dev/null)
+$(uci -q get network.wan.ifname 2>/dev/null)
+$(ip route show default 2>/dev/null | awk '/^default/{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i+1); exit }}')"
+
+    for dev in $candidates; do
+        [ -n "$dev" ] || continue
+        # A bridge/device name from uci can still be a config-only alias.
+        [ -e "$sysfs/$dev" ] || continue
+        echo "$dev"
+        return 0
+    done
+    return 1
 }
 
 tctl_get_lan_device() {
@@ -146,9 +218,140 @@ tctl_lan_subnets() {
     done
 }
 
+# Concrete devices to attach netdev ingress hooks to.
+#
+# A netdev ingress hook bound to a BRIDGE never sees bridged traffic: packets
+# are received on the bridge's physical ports, so the hook must live there.
+# Binding to br-lan silently matches nothing, which is exactly how upload
+# limiting appeared to be applied while having no effect. Non-bridge L3
+# devices (plain ports, VLAN interfaces) are hooked directly.
+tctl_ingress_devices() {
+    local sysfs="${TCTL_SYSFS_NET:-/sys/class/net}"
+    local dev port
+    for dev in $(tctl_get_lan_devices); do
+        if [ -d "$sysfs/$dev/brif" ]; then
+            for port in "$sysfs/$dev/brif/"*; do
+                [ -e "$port" ] || continue
+                basename "$port"
+            done
+        else
+            echo "$dev"
+        fi
+    done | sort -u
+}
+
+# nft chain name for a device's ingress hook (chain names can't contain
+# dots or dashes, which interface names routinely do).
+tctl_ingress_chain() {
+    printf 'ul_%s' "$(printf '%s' "$1" | tr -c 'a-zA-Z0-9' '_')"
+}
+
 # LAN L3 device names only (deduplicated), e.g. "br-lan br-guest eth0.20".
 tctl_get_lan_devices() {
     tctl_lan_subnets | awk '{print $1}' | sort -u
+}
+
+# Convert "a.b.c.d/m" (or a bare host address) to "netbase_int block_size",
+# normalized to the network base. Fails silently on malformed input.
+tctl_cidr_spec() {
+    local cidr="$1" addr mask rest o1 o2 o3 o4 ipint block
+    addr=${cidr%%/*}
+    mask=${cidr#*/}
+    [ "$mask" = "$cidr" ] && mask=32
+    tctl_validate_ip "$addr" || return 1
+    case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$mask" -ge 1 ] && [ "$mask" -le 32 ] || return 1
+    o1=${addr%%.*}; rest=${addr#*.}
+    o2=${rest%%.*}; rest=${rest#*.}
+    o3=${rest%%.*}; o4=${rest##*.}
+    ipint=$(( (o1 << 24) + (o2 << 16) + (o3 << 8) + o4 ))
+    block=$(( 1 << (32 - mask) ))
+    echo "$(( ipint - (ipint % block) )) $block"
+}
+
+# Downstream subnets routed via a next-hop on a LAN interface — e.g. clients
+# behind a second router on the LAN whose packets are forwarded (and NATed on
+# WAN) through this router with their original source addresses. Also includes
+# operator-defined extras from trafficctl.main.extra_subnets (space-separated
+# CIDRs) for setups without an explicit kernel route.
+# Output format matches tctl_lan_subnets; router_int is 0 because no local
+# address lives inside a routed subnet (consumers use 0 to tell routed from
+# directly connected).
+tctl_routed_subnets() {
+    local lan_devs dev cidr spec extras
+    lan_devs=$(tctl_get_lan_devices)
+
+    if [ -n "$lan_devs" ]; then
+        ip route show 2>/dev/null | awk '
+        $1 != "default" && / via / {
+            dev = ""
+            for (i = 1; i <= NF; i++) if ($i == "dev") dev = $(i+1)
+            if (dev != "") print $1, dev
+        }' | while read -r cidr dev; do
+            echo "$lan_devs" | grep -qxF "$dev" || continue
+            spec=$(tctl_cidr_spec "$cidr") || continue
+            echo "$dev $spec 0"
+        done
+    fi
+
+    extras=$(uci -q get trafficctl.main.extra_subnets 2>/dev/null)
+    if [ -n "$extras" ]; then
+        dev=$(tctl_get_lan_device)
+        for cidr in $extras; do
+            spec=$(tctl_cidr_spec "$cidr") || continue
+            echo "$dev $spec 0"
+        done
+    fi
+}
+
+# Every subnet worth monitoring: directly connected LANs first, then routed
+# and extra ones. Duplicate prefixes are dropped (first wins, keeping the
+# connected entry with its real router address).
+tctl_monitored_subnets() {
+    { tctl_lan_subnets; tctl_routed_subnets; } | awk '!seen[$2":"$3]++'
+}
+
+# True (0) when the IP belongs to a directly connected LAN subnet; routed and
+# extra subnets do not count. Used to tell on-link devices from downstream
+# ones that only have an L3 presence here.
+tctl_ip_in_lan() {
+    local ip="$1" o1 o2 o3 o4 rest ipint
+    tctl_validate_ip "$ip" || return 1
+    o1=${ip%%.*}; rest=${ip#*.}
+    o2=${rest%%.*}; rest=${rest#*.}
+    o3=${rest%%.*}; o4=${rest##*.}
+    ipint=$(( (o1 << 24) + (o2 << 16) + (o3 << 8) + o4 ))
+    tctl_lan_subnets | awk -v si="$ipint" '
+        si - (si % $3) == $2 { hit = 1; exit }
+        END { exit hit ? 0 : 1 }'
+}
+
+# Accept a single host address or a CIDR block ("all" means every address).
+# Echoes the normalized target, or fails.
+tctl_validate_target() {
+    local t="$1" addr mask
+    case "$t" in
+        all|any) echo "0.0.0.0/0"; return 0 ;;
+    esac
+    case "$t" in
+        */*)
+            addr=${t%%/*}
+            mask=${t#*/}
+            tctl_validate_ip "$addr" || return 1
+            case "$mask" in ''|*[!0-9]*) return 1 ;; esac
+            [ "$mask" -ge 0 ] && [ "$mask" -le 32 ] || return 1
+            echo "$addr/$mask"
+            ;;
+        *)
+            tctl_validate_ip "$t" || return 1
+            echo "$t"
+            ;;
+    esac
+}
+
+# A target usable inside an nft set/meter name or a rule comment.
+tctl_target_slug() {
+    printf '%s' "$1" | tr './' '__'
 }
 
 tctl_validate_ip() {

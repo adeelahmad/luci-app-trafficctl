@@ -2,6 +2,7 @@
 'require view';
 'require rpc';
 'require fs';
+'require ui';
 
 (function() {
 	if (!document.querySelector('link[href*="trafficctl/status.css"]')) {
@@ -15,6 +16,10 @@
 
 var TRAFFICCTL_BUILD = '20260526i';
 console.log('[trafficctl] build:' + TRAFFICCTL_BUILD);
+
+// Per-device DPI app breakdown from netifyd, keyed by IP. Stays empty when the
+// agent isn't running, which is what makes the App column degrade quietly.
+var netifyMap = {};
 
 var STORAGE_KEY = 'trafficctl_opts';
 var RECENT_KEY = 'trafficctl_recent';
@@ -119,6 +124,18 @@ var callShapeStats = rpc.declare({
 	expect: { result: [] }
 });
 
+
+var callNetifyList = rpc.declare({
+	object: 'luci.trafficctl',
+	method: 'netify_list',
+	expect: { result: [] }
+});
+
+var callNameSet = rpc.declare({
+	object: 'luci.trafficctl',
+	method: 'name_set',
+	params: ['ip', 'name']
+});
 
 var callTelegramGet = rpc.declare({
 	object: 'luci.trafficctl',
@@ -229,6 +246,51 @@ function fmtRate(kbit) {
 }
 function escHtml(s) {
 	return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Manual device naming. Routed devices (behind a downstream router) have no
+// DHCP lease on this router, so an alias — or a PTR record the backend
+// resolves — is the only way they get a name instead of "*".
+function promptRename(ip, current, onDone) {
+	var input = E('input', {
+		'type': 'text',
+		'class': 'cbi-input-text',
+		'value': current === '*' ? '' : current,
+		'placeholder': _('Device name'),
+		'style': 'width:100%'
+	});
+
+	var doSave = function() {
+		var v = (input.value || '').replace(/[^a-zA-Z0-9 _.()-]/g, '').substring(0, 32);
+		callNameSet(ip, v).then(function(res) {
+			ui.hideModal();
+			if (res && res.ok === false) {
+				ui.addNotification(null, E('p', res.msg || _('Rename failed')), 'error');
+				return;
+			}
+			if (onDone) onDone(v);
+		}).catch(function(e) {
+			ui.hideModal();
+			ui.addNotification(null, E('p', e.message), 'error');
+		});
+	};
+
+	input.addEventListener('keydown', function(ev) {
+		if (ev.key === 'Enter') { ev.preventDefault(); doSave(); }
+	});
+
+	var cancelBtn = E('button', { 'class': 'btn' }, _('Cancel'));
+	cancelBtn.addEventListener('click', function() { ui.hideModal(); });
+	var saveBtn = E('button', { 'class': 'btn cbi-button-positive' }, _('Save'));
+	saveBtn.addEventListener('click', doSave);
+
+	ui.showModal(_('Rename device') + ' — ' + ip, [
+		E('p', { 'class': 'tc-c-muted', 'style': 'font-size:12px' },
+			_('Overrides the DHCP lease or DNS name. Leave empty to clear the custom name.')),
+		E('div', { 'style': 'margin:10px 0' }, input),
+		E('div', { 'class': 'right' }, [cancelBtn, ' ', saveBtn])
+	]);
+	setTimeout(function() { input.focus(); input.select(); }, 50);
 }
 
 function mkEthIcon(size) {
@@ -738,7 +800,8 @@ function buildSummaryTable(rows, sortCol, sortDir, onSort, onSelect, speedMap, d
 		{ key:'tcp',              label:'TCP',          num:true,  tip: _('TCP bytes transferred'), hide:true },
 		{ key:'udp',              label:'UDP',          num:true,  tip: _('UDP bytes transferred'), hide:true },
 		{ key:'blocked',          label: _('Inet'),     num:false, tip: _('Internet access status (paused = traffic blocked)') },
-		{ key:'conn_type',        label: _('Link'),     num:false, tip: _('Connection interface (WiFi band or LAN port)') },
+		{ key:'conn_type',        label: _('Link'),     num:false, tip: _('Connection interface (WiFi band, LAN port or routed)') },
+		{ key:'app',              label: _('App'),      num:false, tip: _('Top application by traffic (needs the netifyd DPI agent)') },
 		{ key:'_throttle_kbit',   label: _('Limit'),            num:true,  tip: _('Speed limit: shaper (queue) or limiter (drop)') },
 		{ key:'_drop_packets',    label: _('Drop'),           num:true,  tip: _('Packets dropped by rate limiter'), hide:true },
 		{ key:'_backlog',         label: '📦',           num:true,  tip: _('Bytes queued in traffic shaper'), hide:true }
@@ -813,7 +876,19 @@ function buildSummaryTable(rows, sortCol, sortDir, onSort, onSelect, speedMap, d
 		var sd = speedMap[r.ip];
 		var cellMap = {};
 
-		cellMap.name = E('div', { 'class': 'td tc-fw-bold tc-c-speed' }, escHtml(r.name));
+		var nameText = E('span', {}, escHtml(r.name));
+		var renameBtn = E('span', {
+			'class': 'tc-rename',
+			'title': _('Rename device')
+		}, '✎');
+		renameBtn.addEventListener('click', function(ev) {
+			ev.stopPropagation();
+			promptRename(r.ip, r.name, function(newName) {
+				r.name = newName || '*';
+				nameText.textContent = r.name;
+			});
+		});
+		cellMap.name = E('div', { 'class': 'td tc-fw-bold tc-c-speed tc-name-cell' }, [nameText, renameBtn]);
 		cellMap.ip   = E('div', { 'class': 'td tc-mono' }, escHtml(r.ip));
 		var macEl = r.mac ? E('a', { 'href':'/cgi-bin/luci/admin/network/dhcp','target':'_blank','rel':'noopener','class':'tc-link','title':_('Open DHCP/DNS bindings'),'onclick':'event.stopPropagation()' }, r.mac) : '';
 		cellMap.mac  = E('div', { 'class': 'td tc-mono tc-sm tc-c-muted' }, macEl || '');
@@ -853,6 +928,8 @@ function buildSummaryTable(rows, sortCol, sortDir, onSort, onSelect, speedMap, d
 				}
 			}
 			linkBadge = E('span', { 'class': 'tc-c-faint', 'style': 'cursor:help', 'title': tip }, '?');
+		} else if (ct === 'routed') {
+			linkBadge = E('span', { 'class': 'tc-c-muted', 'style': 'cursor:help', 'title': _('Behind a downstream router (routed subnet)') }, '⇄ ' + _('routed'));
 		} else if (isWifi) {
 			var wLabel = ct === 'wifi' ? 'WiFi' : ct;
 			linkBadge = r.wifi_blocked
@@ -863,6 +940,21 @@ function buildSummaryTable(rows, sortCol, sortDir, onSort, onSelect, speedMap, d
 			linkBadge = E('span', { 'class': 'tc-c-muted' }, [mkEthIcon(14), document.createTextNode(ethLabel)]);
 		}
 		cellMap.conn_type = E('div', { 'class': 'td tc-center' }, linkBadge);
+
+		var appBadge;
+		if (r.app) {
+			var appDetail = netifyMap[r.ip];
+			var appTip = _('Top application by traffic');
+			if (appDetail && appDetail.apps && appDetail.apps.length) {
+				appTip = appDetail.apps.slice(0, 5).map(function(a) {
+					return a.name + ' — ' + fmtBytes(a.bytes);
+				}).join('\n');
+			}
+			appBadge = E('span', { 'class': 'tc-app-badge', 'title': appTip }, escHtml(r.app));
+		} else {
+			appBadge = E('span', { 'class': 'tc-c-faint' }, '—');
+		}
+		cellMap.app = E('div', { 'class': 'td tc-center' }, appBadge);
 
 		var throttleBadge;
 		if (r._throttle_mode === 'shaper') { throttleBadge = E('span', { 'class': 'tc-c-speed tc-fw-bold', 'title': _('Shaper (tc/HTB queue)') }, '≈ ' + fmtRate(r._throttle_kbit)); }
@@ -2202,6 +2294,17 @@ return view.extend({
 				if (!Array.isArray(rows)) rows = [];
 				searchSelect.updateDevices(rows);
 				renderSummary(rows);
+
+				// Breakdown for the App column tooltips; fire-and-forget so a
+				// missing or slow netifyd never delays the table.
+				if (rows.some(function(r) { return r.app; })) {
+					callNetifyList().then(function(list) {
+						if (!Array.isArray(list)) return;
+						var m = {};
+						list.forEach(function(d) { m[d.ip] = d; });
+						netifyMap = m;
+					}).catch(function() {});
+				}
 				setStatus(statusDiv, 'ok', '✓ ' + _('Done'));
 				self._startBytesPoll();
 			})

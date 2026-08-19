@@ -55,6 +55,21 @@ if [ -f "$RULES_FILE" ] && tctl_persist_enabled; then
                     tctl_ratelimit_add "$ip" "$param" "rl_ratelimit_${ip}" 2>/dev/null || \
                     logger -t trafficctl "Failed to restore ratelimit for $ip (${param}kbit)"
                 ;;
+            pfw_pause|pfw_limit)
+                # ip field is a composite key: scope/proto/ip|local/port
+                _scope=${ip%%/*}; _rest=${ip#*/}
+                _proto=${_rest%%/*}; _rest=${_rest#*/}
+                _pip=${_rest%%/*}; _pport=${_rest#*/}
+                [ "$_pip" = "local" ] && _pip="-"
+                if [ "$type" = "pfw_pause" ]; then
+                    /usr/local/bin/trafficctl-portfw.sh pause "$_scope" "$_proto" "$_pip" "$_pport" >/dev/null 2>&1 || \
+                        logger -t trafficctl "Failed to restore port pause for $_pport"
+                else
+                    [ -n "$param" ] && [ "$param" != "0" ] && \
+                        /usr/local/bin/trafficctl-portfw.sh limit "$_scope" "$_proto" "$_pip" "$_pport" "$param" >/dev/null 2>&1 || \
+                        logger -t trafficctl "Failed to restore port limit for $_pport"
+                fi
+                ;;
         esac
     done
 fi

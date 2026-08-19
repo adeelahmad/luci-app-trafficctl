@@ -42,6 +42,15 @@ if [ -z "$MAC" ]; then
     MAC=$(ip neigh show "$IP" 2>/dev/null | grep -oE '[0-9a-fA-F:]{17}' | head -1)
 fi
 MAC=$(echo "$MAC" | tr 'A-F' 'a-f')
+[ "$NAME" = "*" ] && NAME=""
+
+# Same precedence as the summary: manual alias wins, then the lease name above,
+# then cached reverse DNS (the only automatic source for routed devices).
+ALIAS=$(awk -v ip="$IP" '$1 == ip {sub(/^[^ ]+ +/, ""); print; exit}' /etc/trafficctl/names 2>/dev/null)
+[ -n "$ALIAS" ] && NAME="$ALIAS"
+if [ -z "$NAME" ] && [ "$(uci -q get trafficctl.main.resolve_names 2>/dev/null)" != "0" ]; then
+    NAME=$(awk -v ip="$IP" '$1 == ip && $2 != "-" {print $2; exit}' /tmp/trafficctl_rdns_cache 2>/dev/null)
+fi
 [ -z "$NAME" ] && NAME="*"
 
 # Detect connection type — specific interface or band
@@ -50,7 +59,10 @@ CONN_LAST=""
 CONN_CACHE="/tmp/trafficctl_conn_cache"
 [ -f "$CONN_CACHE" ] || : > "$CONN_CACHE"
 
-if [ -n "$MAC" ]; then
+if ! tctl_ip_in_lan "$IP"; then
+    # Not on any connected LAN subnet — reached via a downstream router.
+    CONN_TYPE="routed"
+elif [ -n "$MAC" ]; then
     _wifi_stations=$(
         for _wi in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
             _ch=$(iw dev "$_wi" info 2>/dev/null | awk '/channel/{print $2}')

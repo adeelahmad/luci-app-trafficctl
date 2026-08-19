@@ -22,8 +22,8 @@ mkdir -p "$DATA"
 
 cp -a "$SRC/root/"* "$DATA/"
 mkdir -p "$DATA/www/luci-static/resources/view/trafficctl"
-cp "$SRC/htdocs/luci-static/resources/view/trafficctl/status.js" "$DATA/www/luci-static/resources/view/trafficctl/"
-cp "$SRC/htdocs/luci-static/resources/view/trafficctl/status.css" "$DATA/www/luci-static/resources/view/trafficctl/"
+# Copy every view/asset so new files (portfw.js, ...) can't be missed
+cp "$SRC/htdocs/luci-static/resources/view/trafficctl/"* "$DATA/www/luci-static/resources/view/trafficctl/"
 
 chmod +x "$DATA/usr/local/bin/trafficctl-"*.sh
 chmod +x "$DATA/usr/libexec/rpcd/luci.trafficctl"
@@ -134,6 +134,14 @@ PKGINFO
 
     # APKv2: concatenate control + data
     cat "$WORKDIR/control.tar.gz" "$WORKDIR/data.tar.gz" > "$APK_FILE"
+fi
+
+if ! command -v apk >/dev/null 2>&1; then
+    # The fallback path emits the older concatenated-tarball layout. apk-tools 3
+    # (OpenWrt 25.12+) rejects it with "file format is invalid or inconsistent";
+    # only the SDK build in auto-release.yml produces an installable APK.
+    echo "WARNING: built without 'apk mkpkg' — this file is NOT installable by apk-tools 3." >&2
+    echo "         For a dev install, extract the payload tarball directly instead." >&2
 fi
 
 echo "$APK_FILE"

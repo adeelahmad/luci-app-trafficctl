@@ -34,13 +34,21 @@ list)
 	printf '"unblock":{"ip":"str","label":"str"},'
 	printf '"macfilter_add":{"ip":"str"},'
 	printf '"macfilter_remove":{"ip":"str"},'
-	printf '"ratelimit":{"ip":"str","rate_kbit":"int","label":"str"},'
+	printf '"ratelimit":{"ip":"str","rate_kbit":"int","label":"str","mode":"str"},'
 	printf '"ratelimit_stats":{},'
 	printf '"shape_add":{"ip":"str","rate_kbit":"int","label":"str"},'
 	printf '"shape_remove":{"ip":"str","label":"str"},'
 	printf '"shape_status":{"ip":"str"},'
 	printf '"shape_stats":{},'
 	printf '"rdns":{"ip":"str"},'
+	printf '"netify_status":{},'
+	printf '"netify_list":{},'
+	printf '"netify_collect":{"secs":"int"},'
+	printf '"names_list":{},'
+	printf '"name_set":{"ip":"str","name":"str"},'
+	printf '"name_clear":{"ip":"str"},'
+	printf '"portfw_list":{},'
+	printf '"portfw_ctl":{"action":"str","scope":"str","proto":"str","ip":"str","port":"str","rate_kbit":"int"},'
 	printf '"config_get":{},'
 	printf '"config_set":{"enabled":"bool","default_mode":"str","sw":"bool","hw":"bool"},'
 	printf '"telegram_config_get":{},'
@@ -120,10 +128,12 @@ call)
 		ip=$(echo "$input" | jsonfilter -e '@.ip' 2>/dev/null)
 		rate=$(echo "$input" | jsonfilter -e '@.rate_kbit' 2>/dev/null)
 		label=$(sanitize_label "$(echo "$input" | jsonfilter -e '@.label' 2>/dev/null)")
+		mode=$(echo "$input" | jsonfilter -e '@.mode' 2>/dev/null)
+		case "$mode" in each|shared) ;; *) mode="" ;; esac
 		if [ -z "$ip" ]; then
 			echo '{"ok":false,"msg":"ip required"}'
 		else
-			"$SCRIPTS/trafficctl-ratelimit.sh" "$ip" "${rate:-0}" "$label"
+			"$SCRIPTS/trafficctl-ratelimit.sh" "$ip" "${rate:-0}" "$label" "$mode"
 		fi
 		;;
 	ratelimit_stats)
@@ -174,6 +184,72 @@ call)
 		else
 			"$SCRIPTS/trafficctl-rdns.sh" "$ip"
 		fi
+		;;
+	netify_status)
+		"$SCRIPTS/trafficctl-netify.sh" status
+		;;
+	netify_list)
+		printf '{"result":'
+		"$SCRIPTS/trafficctl-netify.sh" list
+		printf '}'
+		;;
+	netify_collect)
+		read -r input
+		secs=$(echo "$input" | jsonfilter -e '@.secs' 2>/dev/null)
+		"$SCRIPTS/trafficctl-netify.sh" collect "${secs:-3}"
+		;;
+	names_list)
+		printf '{"result":'
+		"$SCRIPTS/trafficctl-names.sh" list
+		printf '}'
+		;;
+	name_set)
+		read -r input
+		ip=$(echo "$input" | jsonfilter -e '@.ip' 2>/dev/null)
+		name=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+		if [ -z "$ip" ]; then
+			echo '{"ok":false,"msg":"ip required"}'
+		elif [ -z "$name" ]; then
+			# Empty name means "forget the alias" so the UI can clear a name
+			# by submitting a blank field.
+			"$SCRIPTS/trafficctl-names.sh" remove "$ip"
+		else
+			"$SCRIPTS/trafficctl-names.sh" set "$ip" "$name"
+		fi
+		;;
+	name_clear)
+		read -r input
+		ip=$(echo "$input" | jsonfilter -e '@.ip' 2>/dev/null)
+		if [ -z "$ip" ]; then
+			echo '{"ok":false,"msg":"ip required"}'
+		else
+			"$SCRIPTS/trafficctl-names.sh" remove "$ip"
+		fi
+		;;
+	portfw_list)
+		printf '{"result":'
+		"$SCRIPTS/trafficctl-portfw.sh" list
+		printf '}'
+		;;
+	portfw_ctl)
+		read -r input
+		action=$(echo "$input" | jsonfilter -e '@.action' 2>/dev/null)
+		scope=$(echo "$input" | jsonfilter -e '@.scope' 2>/dev/null)
+		proto=$(echo "$input" | jsonfilter -e '@.proto' 2>/dev/null)
+		ip=$(echo "$input" | jsonfilter -e '@.ip' 2>/dev/null)
+		port=$(echo "$input" | jsonfilter -e '@.port' 2>/dev/null)
+		rate=$(echo "$input" | jsonfilter -e '@.rate_kbit' 2>/dev/null)
+		case "$action" in
+			pause|resume)
+				"$SCRIPTS/trafficctl-portfw.sh" "$action" "$scope" "$proto" "${ip:--}" "$port"
+				;;
+			limit)
+				"$SCRIPTS/trafficctl-portfw.sh" limit "$scope" "$proto" "${ip:--}" "$port" "${rate:-0}"
+				;;
+			*)
+				echo '{"ok":false,"msg":"action must be pause, resume or limit"}'
+				;;
+		esac
 		;;
 	config_get)
 		enabled=$(uci -q get trafficctl.main.enabled)

@@ -12,11 +12,15 @@
 _offload=$(tctl_get_offload_mode)
 [ "$_offload" != "none" ] && [ "$TCTL_FW" = "nft" ] && exec /usr/local/bin/trafficctl-bytes-nft.sh
 
-# All LAN subnets (multi-bridge / multi-VLAN aware), as awk membership spec.
-MATCH_SPEC=$(tctl_lan_subnets | awk '{printf "%s%s:%s:%s",(NR>1?" ":""),$2,$3,$4}')
+# All monitored subnets (connected LANs + routed downstream subnets +
+# trafficctl.main.extra_subnets), as awk membership spec.
+MATCH_SPEC=$(tctl_monitored_subnets | awk '{printf "%s%s:%s:%s",(NR>1?" ":""),$2,$3,$4}')
 [ -z "$MATCH_SPEC" ] && { echo '[]'; exit 0; }
 
-cat /proc/net/nf_conntrack 2>/dev/null | awk -v spec="$MATCH_SPEC" '
+# Router-owned IPv4 addresses, excluded from the NAT fallback below.
+LOCAL_IPS=$(ip -4 addr show 2>/dev/null | awk '/inet /{split($2,a,"/");print a[1]}' | tr '\n' ' ')
+
+cat /proc/net/nf_conntrack 2>/dev/null | awk -v spec="$MATCH_SPEC" -v localips="$LOCAL_IPS" '
 function ip2int(ip,   a) {
     split(ip, a, ".")
     return a[1]*16777216 + a[2]*65536 + a[3]*256 + a[4]
@@ -34,21 +38,32 @@ BEGIN {
         split(parts[k], kv, ":")
         base[k] = kv[1] + 0; blk[k] = kv[2] + 0
     }
+    nl = split(localips, lp, " ")
+    for (k = 1; k <= nl; k++) if (lp[k] != "") islocal[lp[k]] = 1
 }
 {
-    src=""; bytes_orig=0; bytes_reply=0; bc=0
+    src=""; osrc=""; rdst=""; nsrc=0; bytes_orig=0; bytes_reply=0; bc=0
     for (i=1; i<=NF; i++) {
         if ($i ~ /^src=/) {
             v = substr($i, 5)
+            nsrc++
+            if (nsrc == 1) osrc = v
             if (src == "" && is_lan(v)) src = v
         }
+        if (nsrc == 2 && rdst == "" && $i ~ /^dst=/) rdst = substr($i, 5)
         if ($i ~ /^bytes=/) {
             v = substr($i, 7) + 0
             bc++
-            if (src != "" && bc == 1) bytes_orig = v
-            else if (src != "" && bc == 2) bytes_reply = v
+            if (bc == 1) bytes_orig = v
+            else if (bc == 2) bytes_reply = v
         }
     }
+    # NAT fallback: flow was SNAT/masqueraded here (reply dst != original
+    # src), so the original src is a forwarded client even though it is not
+    # in any monitored subnet (e.g. behind a downstream router).
+    if (src == "" && osrc != "" && rdst != "" && rdst != osrc && \
+        osrc ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && !(osrc in islocal))
+        src = osrc
     if (src != "") {
         key = src
         in_total[key] += bytes_reply

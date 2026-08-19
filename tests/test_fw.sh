@@ -43,9 +43,12 @@ assert_eq "invalid IP trailing dot" 1 "$(tctl_validate_ip '192.168.1.1.' && echo
 
 assert_eq "lan device fallback" "br-lan" "$(tctl_get_lan_device)"
 
-# --- tctl_get_wan_device (fallback) ---
+# --- tctl_get_wan_device ---
+# With nothing resolvable it must FAIL rather than return the literal "wan":
+# that is an interface name, not a device, and nft silently refuses to hook it.
 
-assert_eq "wan device fallback" "wan" "$(tctl_get_wan_device)"
+assert_eq "wan device: fails when nothing resolves" 1 "$(tctl_get_wan_device >/dev/null && echo 0 || echo 1)"
+assert_eq "wan device: emits no bogus name" "" "$(tctl_get_wan_device 2>/dev/null)"
 
 # --- TCTL_FW detection ---
 

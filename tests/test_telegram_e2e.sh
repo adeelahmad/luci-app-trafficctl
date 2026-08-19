@@ -879,7 +879,7 @@ case "$*" in
         echo "Station f2:04:16:28:3a:4c (on wlan0)"
     ;;
     *info*)
-        printf '\tchannel 36 width 5180\n\tssid MyHomeWiFi-5G\n'
+        printf '\tchannel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz\n\tssid MyHomeWiFi-5G\n'
     ;;
     *)
         echo "Interface wlan0"

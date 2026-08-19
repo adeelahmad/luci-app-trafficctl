@@ -67,10 +67,18 @@ tg_api() {
 		-d "$body" 2>/dev/null
 }
 
+# Escape a string for embedding in a JSON body: backslashes, quotes, tabs,
+# and real newlines (raw newlines are invalid inside JSON strings and make
+# Telegram reject the whole request with a 400).
+tg_json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g;s/"/\\"/g;s/	/\\t/g' | \
+		awk 'NR==1{printf "%s",$0} NR>1{printf "\\n%s",$0}'
+}
+
 tg_send() {
 	local text="$1" markup="$2"
 	local body
-	text=$(printf '%s' "$text" | sed 's/\\/\\\\/g;s/"/\\"/g')
+	text=$(tg_json_escape "$text")
 	if [ -n "$markup" ]; then
 		body=$(printf '{"chat_id":"%s","text":"%s","parse_mode":"HTML","reply_markup":%s}' \
 			"$TG_CHAT_ID" "$text" "$markup")
@@ -83,14 +91,14 @@ tg_send() {
 
 tg_answer_cb() {
 	local cb_id="$1" text="$2"
-	text=$(printf '%s' "$text" | sed 's/\\/\\\\/g;s/"/\\"/g')
+	text=$(tg_json_escape "$text")
 	tg_api "answerCallbackQuery" \
 		"$(printf '{"callback_query_id":"%s","text":"%s"}' "$cb_id" "$text")" >/dev/null
 }
 
 tg_edit_msg() {
 	local msg_id="$1" text="$2" markup="$3"
-	text=$(printf '%s' "$text" | sed 's/\\/\\\\/g;s/"/\\"/g')
+	text=$(tg_json_escape "$text")
 	local body
 	if [ -n "$markup" ]; then
 		body=$(printf '{"chat_id":"%s","message_id":%s,"text":"%s","parse_mode":"HTML","reply_markup":%s}' \
@@ -232,23 +240,43 @@ ONLINE_STATE_FILE="/tmp/trafficctl_tg_online"
 DHCP_TRIGGER_FILE="/tmp/trafficctl_tg_newdev"
 
 get_wifi_info() {
-	local mac="$1" iw_out="" iface="" ssid="" signal="" freq=""
-	for iface in /sys/class/net/wlan*/phy80211; do
-		[ -d "$iface" ] || continue
-		iface=$(basename "$(dirname "$iface")")
-		iw_out=$(iw dev "$iface" station get "$mac" 2>/dev/null) && break
+	local mac="$1" iw_out="" iface="" cand="" ssid="" signal="" freq=""
+	# Iterate all wireless interfaces via iw (covers phy0-ap0 style names,
+	# not just wlan*).
+	for cand in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+		iw_out=$(iw dev "$cand" station get "$mac" 2>/dev/null)
+		if [ -n "$iw_out" ]; then
+			iface="$cand"
+			break
+		fi
 	done
 	if [ -n "$iw_out" ]; then
-		signal=$(echo "$iw_out" | awk '/signal:/{print $2}')
-		freq=$(iw dev "$iface" info 2>/dev/null | awk '/channel/{if($4>5000)print "5GHz";else print "2.4GHz"}')
-		ssid=$(iw dev "$iface" info 2>/dev/null | awk '/ssid/{print $2}')
+		signal=$(echo "$iw_out" | awk '/signal:/{print $2; exit}')
+		# channel line: "channel 36 (5180 MHz), width: 80 MHz, ..." — find the
+		# first field that parses to a plausible frequency in MHz (the channel
+		# number itself is < 2400, so it never matches)
+		freq=$(iw dev "$iface" info 2>/dev/null | \
+			awk '/channel/{
+				for (i = 2; i <= NF; i++) {
+					v = $i; gsub(/[^0-9]/, "", v)
+					if (v + 0 >= 2400 && v + 0 <= 7200) { f = v + 0; break }
+				}
+				if (f >= 5925) print "6GHz"
+				else if (f >= 5000) print "5GHz"
+				else if (f > 0) print "2.4GHz"
+				exit
+			}')
+		ssid=$(iw dev "$iface" info 2>/dev/null | awk '/ssid/{print $2; exit}')
 	fi
 	printf '%s\t%s\t%s\t%s' "$iface" "$ssid" "$signal" "$freq"
 }
 
 get_device_conns() {
-	local ip="$1"
-	cat /proc/net/nf_conntrack 2>/dev/null | grep -c "src=$ip " 2>/dev/null || echo 0
+	local ip="$1" n
+	# grep -c prints 0 itself on no match (with exit status 1), so an
+	# "|| echo 0" here would emit a second line and corrupt the value.
+	n=$(grep -c "src=$ip " /proc/net/nf_conntrack 2>/dev/null)
+	echo "${n:-0}"
 }
 
 get_router_vars() {
@@ -294,23 +322,24 @@ format_new_device_msg() {
 			    -v freq="$freq" -v iface="$iface" -v clients="$TVAR_CLIENTS" \
 			    -v up="$TVAR_UPTIME" -v wan="$TVAR_WAN_IP" -v ld="$TVAR_LOAD" \
 			    -v conns="$conns" '{
-				gsub(/\{\{\s*name\s*\}\}/, n)
-				gsub(/\{\{\s*ip\s*\}\}/, i)
-				gsub(/\{\{\s*mac\s*\}\}/, m)
-				gsub(/\{\{\s*link\s*\}\}/, l)
-				gsub(/\{\{\s*date\s*\}\}/, dt)
-				gsub(/\{\{\s*time\s*\}\}/, tm)
-				gsub(/\{\{\s*datetime\s*\}\}/, dtm)
-				gsub(/\{\{\s*router\s*\}\}/, rtr)
-				gsub(/\{\{\s*ssid\s*\}\}/, ssid)
-				gsub(/\{\{\s*signal\s*\}\}/, sig)
-				gsub(/\{\{\s*freq\s*\}\}/, freq)
-				gsub(/\{\{\s*iface\s*\}\}/, iface)
-				gsub(/\{\{\s*clients\s*\}\}/, clients)
-				gsub(/\{\{\s*uptime\s*\}\}/, up)
-				gsub(/\{\{\s*wan_ip\s*\}\}/, wan)
-				gsub(/\{\{\s*load\s*\}\}/, ld)
-				gsub(/\{\{\s*conns\s*\}\}/, conns)
+				# [ \t]* instead of \s* — BusyBox awk has no \s class
+				gsub(/\{\{[ \t]*name[ \t]*\}\}/, n)
+				gsub(/\{\{[ \t]*ip[ \t]*\}\}/, i)
+				gsub(/\{\{[ \t]*mac[ \t]*\}\}/, m)
+				gsub(/\{\{[ \t]*link[ \t]*\}\}/, l)
+				gsub(/\{\{[ \t]*date[ \t]*\}\}/, dt)
+				gsub(/\{\{[ \t]*time[ \t]*\}\}/, tm)
+				gsub(/\{\{[ \t]*datetime[ \t]*\}\}/, dtm)
+				gsub(/\{\{[ \t]*router[ \t]*\}\}/, rtr)
+				gsub(/\{\{[ \t]*ssid[ \t]*\}\}/, ssid)
+				gsub(/\{\{[ \t]*signal[ \t]*\}\}/, sig)
+				gsub(/\{\{[ \t]*freq[ \t]*\}\}/, freq)
+				gsub(/\{\{[ \t]*iface[ \t]*\}\}/, iface)
+				gsub(/\{\{[ \t]*clients[ \t]*\}\}/, clients)
+				gsub(/\{\{[ \t]*uptime[ \t]*\}\}/, up)
+				gsub(/\{\{[ \t]*wan_ip[ \t]*\}\}/, wan)
+				gsub(/\{\{[ \t]*load[ \t]*\}\}/, ld)
+				gsub(/\{\{[ \t]*conns[ \t]*\}\}/, conns)
 				gsub(/\\n/, "\n")
 				print
 			}'
@@ -382,6 +411,10 @@ build_device_keyboard() {
 
 	for ip in $(echo "$devices" | jsonfilter -e '@[*].ip' 2>/dev/null); do
 		name=$(echo "$devices" | jsonfilter -e "@[@.ip='$ip'].name" 2>/dev/null)
+		# Keep button labels JSON-safe: drop quotes/backslashes and anything
+		# non-ASCII, then truncate. A %.12s cut through a multi-byte character
+		# would produce invalid UTF-8 and Telegram would reject the keyboard.
+		name=$(printf '%s' "$name" | tr -cd 'a-zA-Z0-9 _.()-')
 		btn=$(printf '{"text":"%.12s %s","callback_data":"act:menu:%s"}' \
 			"${name:-$ip}" "$ip" "$ip")
 		if [ "$col" -eq 0 ]; then
@@ -691,7 +724,10 @@ main() {
 		ok=$(echo "$response" | jsonfilter -e '@.ok' 2>/dev/null)
 		[ "$ok" = "true" ] || { sleep 5; continue; }
 
-		update_count=$(echo "$response" | jsonfilter -l '@.result' 2>/dev/null || echo 0)
+		# jsonfilter has no array-length query (-l is a numeric result limit),
+		# so count matched update_ids instead.
+		update_count=$(echo "$response" | jsonfilter -e '@.result[*].update_id' 2>/dev/null | wc -l)
+		update_count=$((update_count + 0))
 		i=0
 		while [ "$i" -lt "$update_count" ]; do
 			update=$(echo "$response" | jsonfilter -e "@.result[$i]" 2>/dev/null)

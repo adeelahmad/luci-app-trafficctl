@@ -611,3 +611,28 @@
     display: flex; flex-wrap: wrap; align-items: center;
     gap: 6px; padding-top: 4px;
 }
+
+/* Device rename affordance — the pencil only appears on row hover so the
+   name column stays clean, and it must sit above the row's click handler. */
+.tc-name-cell { display: flex; align-items: center; gap: 6px; }
+.tc-rename {
+	opacity: 0;
+	cursor: pointer;
+	font-size: 11px;
+	color: var(--tc-muted);
+	transition: opacity .15s ease, color .15s ease;
+}
+.table.tc-table .tr:hover .tc-rename { opacity: .6; }
+.tc-rename:hover { opacity: 1 !important; color: var(--tc-speed); }
+
+/* DPI application label (netifyd). Muted pill so it reads as metadata rather
+   than a control. */
+.tc-app-badge {
+	font-size: 11px;
+	padding: 1px 6px;
+	border-radius: 8px;
+	background: var(--tc-chip-bg, rgba(127,127,127,.12));
+	color: var(--tc-muted);
+	cursor: help;
+	white-space: nowrap;
+}
